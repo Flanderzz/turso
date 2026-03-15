@@ -1585,11 +1585,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Reset the RowidAllocator to match rebuilt sqlite_sequence.
                 let allocator = self.mvstore.get_rowid_allocator(&table_id);
                 allocator.initialize(Some(max_rowid));
-                tracing::debug!(
-                    "Reset RowidAllocator for table {} to max_rowid {}",
-                    table_name,
-                    max_rowid
-                );
             }
         }
 
@@ -1645,8 +1640,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         max_rowid: i64,
     ) -> Result<()> {
         use crate::types::{ImmutableRecord, Value};
-
-        tracing::debug!("Updating sqlite_sequence: {} -> {}", table_name, max_rowid);
 
         let record = ImmutableRecord::from_values(
             &[
@@ -1800,11 +1793,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
         self.mvstore.insert_version(row_id, row_version);
 
-        tracing::debug!(
-            "Inserted new sqlite_sequence row: {} -> rowid {}",
-            table_name,
-            new_rowid
-        );
         Ok(())
     }
 

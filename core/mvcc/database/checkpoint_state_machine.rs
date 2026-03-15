@@ -1654,7 +1654,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
         match existing_row_ids.len() {
             0 => {
-                self.insert_new_sqlite_sequence_row(seq_table_id, &table_name, row_data)?;
+                self.insert_new_sqlite_sequence_row(seq_table_id, row_data)?;
             }
             1 => {
                 self.update_existing_sqlite_sequence_row(existing_row_ids[0].clone(), row_data)?;
@@ -1663,7 +1663,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 for row_id in existing_row_ids {
                     self.delete_sqlite_sequence_row(row_id)?;
                 }
-                self.insert_new_sqlite_sequence_row(seq_table_id, &table_name, row_data)?;
+                self.insert_new_sqlite_sequence_row(seq_table_id, row_data)?;
             }
         }
 
@@ -1766,7 +1766,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     fn insert_new_sqlite_sequence_row(
         &mut self,
         seq_table_id: MVTableId,
-        table_name: &str,
         row_data: Vec<u8>,
     ) -> Result<()> {
         use crate::mvcc::database::{Row, RowID, RowKey, RowVersion, TxTimestampOrID};

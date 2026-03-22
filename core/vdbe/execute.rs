@@ -13762,20 +13762,14 @@ fn op_vacuum_inner(
                         })
                         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-                    let temp_file = tempfile::Builder::new()
-                        .prefix("turso_vacuum_")
-                        .suffix(".db")
-                        .tempfile_in(&temp_parent)
-                        .map_err(|err| {
-                            LimboError::InternalError(format!(
-                                "Failed to create temporary file for VACUUM: {err}"
-                            ))
-                        })?;
-
-                    let path = temp_file.path().to_string_lossy().to_string();
-                    drop(temp_file);
-
-                    path
+                    let rand = program
+                        .connection
+                        .db
+                        .io
+                        .generate_random_number()
+                        .unsigned_abs();
+                    let path = temp_parent.join(format!("turso-vacuum-{rand:016x}.db"));
+                    path.to_string_lossy().to_string()
                 };
 
                 // Store vacuum metadata and get original database path for plain VACUUM

@@ -14479,7 +14479,13 @@ fn op_vacuum_inner(
                             drop(dest_conn);
 
                             if program.connection.db.mvcc_enabled() {
-                                // MVCC mode still uses temp-file replacement semantics
+                                // commit and checkpoint before replacing the file to flush
+                                // all WAL frames and prevent stale frame replay
+                                program.connection.execute("COMMIT")?;
+                                program
+                                    .connection
+                                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
                                 remove_vacuum_sidecars(temp_path)?;
                                 match std::fs::rename(temp_path, original_path) {
                                     Ok(()) => {}
@@ -14513,9 +14519,15 @@ fn op_vacuum_inner(
                                     .connection
                                     .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
+                                // reaquire exclusive lock to block writers
+                                program.connection.execute("BEGIN EXCLUSIVE")?;
+
                                 // Legacy WAL mode overwrites source contents in-place so the
                                 // connection keeps using the same file handle
                                 copy_vacuum_file_into_source(temp_path, original_path)?;
+
+                                // commit empty transaction to release lock
+                                program.connection.execute("COMMIT")?;
 
                                 match std::fs::remove_file(temp_path) {
                                     Ok(()) => {}
@@ -14554,7 +14566,7 @@ fn op_vacuum_inner(
 
                 // Commit source transaction after finalization so plain VACUUM
                 // keeps its write lock through swap/copy-back.
-                if !vacuum_state.is_plain_vacuum || program.connection.db.mvcc_enabled() {
+                if !vacuum_state.is_plain_vacuum {
                     program.connection.execute("COMMIT")?;
                 }
 

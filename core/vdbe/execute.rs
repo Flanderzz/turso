@@ -13772,13 +13772,10 @@ fn op_vacuum_inner(
                             ))
                         })?;
 
-                    let (_file, path) = temp_file.keep().map_err(|err| {
-                        LimboError::InternalError(format!(
-                            "Failed to persist temporary file for VACUUM: {err}"
-                        ))
-                    })?;
+                    let path = temp_file.path().to_string_lossy().to_string();
+                    drop(temp_file);
 
-                    path.to_string_lossy().to_string()
+                    path
                 };
 
                 // Store vacuum metadata and get original database path for plain VACUUM

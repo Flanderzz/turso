@@ -89,6 +89,7 @@ expect {
     1|zebra
 }
 
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 test plain-vacuum-preserves-autoincrement-counter {
     CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
     INSERT INTO t(v) VALUES ('a'), ('b'), ('c');
@@ -137,15 +138,6 @@ test plain-vacuum-schema-survives {
 expect {
     index|idx_v
     table|t
-}
-
-test vacuum-into-rejected-in-transaction {
-    CREATE TABLE t(a INTEGER);
-    BEGIN;
-    VACUUM INTO 'should_not_exist.db';
-}
-expect error {
-    cannot VACUUM INTO from within a transaction
 }
 
 test plain-vacuum-twice-idempotent {

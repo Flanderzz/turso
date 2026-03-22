@@ -3205,7 +3205,9 @@ fn test_mvcc_vacuum_same_connection_stress(tmp_db: TempDatabase) -> anyhow::Resu
     }
 
     for i in 1..=5 {
-        conn.execute(format!("INSERT INTO categories(id, name) VALUES ({i}, 'cat_{i}')"))?;
+        conn.execute(format!(
+            "INSERT INTO categories(id, name) VALUES ({i}, 'cat_{i}')"
+        ))?;
     }
 
     // Run VACUUM

@@ -14506,7 +14506,8 @@ fn op_vacuum_inner(
                                     }
                                 }
                             } else {
-                                
+                                // commit the exclusive transaction and checkpoint to flush all WAL
+                                // frames into the main DB
                                 program.connection.execute("COMMIT")?;
                                 program
                                     .connection

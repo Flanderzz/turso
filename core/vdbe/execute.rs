@@ -14506,6 +14506,12 @@ fn op_vacuum_inner(
                                     }
                                 }
                             } else {
+                                
+                                program.connection.execute("COMMIT")?;
+                                program
+                                    .connection
+                                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
                                 // Legacy WAL mode overwrites source contents in-place so the
                                 // connection keeps using the same file handle
                                 copy_vacuum_file_into_source(temp_path, original_path)?;
@@ -14547,7 +14553,9 @@ fn op_vacuum_inner(
 
                 // Commit source transaction after finalization so plain VACUUM
                 // keeps its write lock through swap/copy-back.
-                program.connection.execute("COMMIT")?;
+                if !vacuum_state.is_plain_vacuum || program.connection.db.mvcc_enabled() {
+                    program.connection.execute("COMMIT")?;
+                }
 
                 // Clean up only non-WAL sidecars at original path.
                 // The -wal and -shm files are owned by the pager and must

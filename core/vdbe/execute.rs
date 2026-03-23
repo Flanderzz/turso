@@ -13670,13 +13670,12 @@ fn op_vacuum_inner(
     }
 
     fn copy_vacuum_file_into_source(temp_path: &str, original_path: &str) -> Result<()> {
-        let data = std::fs::read(temp_path).map_err(|err| {
+        let mut temp_file = std::fs::File::open(temp_path).map_err(|err| {
             LimboError::InternalError(format!(
-                "Failed to read VACUUM temp file {temp_path}: {err}"
+                "Failed to open VACUUM temp file {temp_path}: {err}"
             ))
         })?;
         let mut source_file = std::fs::OpenOptions::new()
-            .read(true)
             .write(true)
             .truncate(true)
             .open(original_path)
@@ -13685,10 +13684,9 @@ fn op_vacuum_inner(
                     "Failed to open source database {original_path} for VACUUM copy-back: {err}"
                 ))
             })?;
-        use std::io::Write;
-        source_file.write_all(&data).map_err(|err| {
+        std::io::copy(&mut temp_file, &mut source_file).map_err(|err| {
             LimboError::InternalError(format!(
-                "Failed to write VACUUM data into source database: {err}"
+                "Failed to copy VACUUM temp file into source database: {err}"
             ))
         })?;
         source_file.sync_all().map_err(|err| {
@@ -13769,13 +13767,21 @@ fn op_vacuum_inner(
                         })
                         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-                    let rand = program
-                        .connection
-                        .db
-                        .io
-                        .generate_random_number()
-                        .unsigned_abs();
-                    let path = temp_parent.join(format!("turso-vacuum-{rand:016x}.db"));
+                    let temp_file = tempfile::Builder::new()
+                        .prefix("turso_vacuum_")
+                        .suffix(".db")
+                        .tempfile_in(&temp_parent)
+                        .map_err(|err| {
+                            LimboError::InternalError(format!(
+                                "Failed to create temporary file for VACUUM: {err}"
+                            ))
+                        })?;
+
+                    let (_file, path) = temp_file.keep().map_err(|err| {
+                        LimboError::InternalError(format!(
+                            "Failed to persist temporary file for VACUUM: {err}"
+                        ))
+                    })?;
                     path.to_string_lossy().to_string()
                 };
 
@@ -14460,66 +14466,94 @@ fn op_vacuum_inner(
 
             OpVacuumSubState::Done { dest_conn } => {
                 dest_conn.execute("COMMIT")?;
+                let finalize_result = (|| -> Result<()> {
+                    if vacuum_state.is_plain_vacuum {
+                        let original_path =
+                            vacuum_state.original_db_path.as_ref().ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "Missing original database path for plain VACUUM".to_string(),
+                                )
+                            })?;
+                        let temp_path =
+                            vacuum_state.temp_vacuum_path.as_ref().ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "Missing temporary database path for plain VACUUM".to_string(),
+                                )
+                            })?;
 
-                if vacuum_state.is_plain_vacuum {
-                    let original_path =
-                        vacuum_state.original_db_path.as_ref().ok_or_else(|| {
-                            LimboError::InternalError(
-                                "Missing original database path for plain VACUUM".to_string(),
-                            )
-                        })?;
-                    let temp_path = vacuum_state.temp_vacuum_path.as_ref().ok_or_else(|| {
-                        LimboError::InternalError(
-                            "Missing temporary database path for plain VACUUM".to_string(),
-                        )
-                    })?;
+                        if original_path != ":memory:" {
+                            // Flush destination WAL into the main DB file so the
+                            // copied temp file is a complete standalone image.
+                            dest_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                            drop(dest_conn);
 
-                    if original_path != ":memory:" {
-                        dest_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-                        drop(dest_conn);
-
-                        // Flush all source WAL frames to the main DB file and
-                        // truncate the WAL. After this the source DB file is a
-                        // self-contained image with no WAL frames to replay.
-                        program.connection.execute("COMMIT")?;
-                        program
-                            .connection
-                            .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-
-                        // Overwrite source with compacted content
-                        copy_vacuum_file_into_source(temp_path, original_path)?;
-
-                        match std::fs::remove_file(temp_path) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(err) => {
-                                return Err(LimboError::InternalError(format!(
-                                    "Failed to remove VACUUM temp database {temp_path}: {err}"
-                                )));
+                            // In non-MVCC mode we keep the source exclusive transaction
+                            // open during copy-back so no concurrent writers can interleave.
+                            if program.connection.db.mvcc_enabled() {
+                                remove_vacuum_sidecars(temp_path)?;
+                                match std::fs::rename(temp_path, original_path) {
+                                    Ok(()) => {}
+                                    Err(err)
+                                        if err.kind() == std::io::ErrorKind::CrossesDevices =>
+                                    {
+                                        copy_vacuum_file_into_source(temp_path, original_path)?;
+                                        match std::fs::remove_file(temp_path) {
+                                            Ok(()) => {}
+                                            Err(remove_err)
+                                                if remove_err.kind()
+                                                    == std::io::ErrorKind::NotFound => {}
+                                            Err(remove_err) => {
+                                                return Err(LimboError::InternalError(format!(
+                                                    "Failed to remove VACUUM temp database {temp_path}: {remove_err}"
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        return Err(LimboError::InternalError(format!(
+                                            "Failed to overwrite database during VACUUM: {err}"
+                                        )));
+                                    }
+                                }
+                            } else {
+                                copy_vacuum_file_into_source(temp_path, original_path)?;
+                                match std::fs::remove_file(temp_path) {
+                                    Ok(()) => {}
+                                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(err) => {
+                                        return Err(LimboError::InternalError(format!(
+                                            "Failed to remove VACUUM temp database {temp_path}: {err}"
+                                        )));
+                                    }
+                                }
+                                remove_vacuum_sidecars(temp_path)?;
                             }
-                        }
-                        remove_vacuum_sidecars(temp_path)?;
 
-                        // Force the pager to re-read everything from the
-                        // replaced file on the next access.
-                        let source_pager = program.connection.pager.load();
-                        source_pager.clear_page_cache(true);
-                        source_pager.set_schema_cookie(None);
-
-                        for ext in ["-journal", "-log"] {
-                            let sidecar = format!("{original_path}{ext}");
-                            match std::fs::remove_file(&sidecar) {
-                                Ok(()) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(_) => {}
-                            }
+                            // Source DB content changed under the existing pager.
+                            let source_pager = program.connection.pager.load();
+                            source_pager.clear_page_cache(true);
+                            source_pager.set_schema_cookie(None);
+                        } else {
+                            // Plain VACUUM on :memory: is treated as a no-op in Init.
+                            drop(dest_conn);
+                            let _ = std::fs::remove_file(temp_path);
                         }
                     } else {
+                        // VACUUM INTO keeps destination as-is.
                         drop(dest_conn);
-                        let _ = std::fs::remove_file(temp_path);
                     }
+                    Ok(())
+                })();
+
+                if let Err(err) = finalize_result {
+                    let _ = program.connection.execute("ROLLBACK");
+                    return Err(err);
+                }
+
+                if vacuum_state.is_plain_vacuum && !program.connection.db.mvcc_enabled() {
+                    // Discard stale WAL frames from the source transaction after copy-back.
+                    program.connection.execute("ROLLBACK")?;
                 } else {
-                    drop(dest_conn);
                     program.connection.execute("COMMIT")?;
                 }
 

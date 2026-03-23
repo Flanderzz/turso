@@ -13727,7 +13727,12 @@ fn op_vacuum_inner(
                 };
 
                 // SQLite treats plain VACUUM on :memory: as a no-op
-                if vacuum_state.is_plain_vacuum && original_db_path.as_deref() == Some(":memory:") {
+                // Also skip when MVCC is enabled: the file-level copy-back
+                // would invalidate the MvStore's in-memory version metadata.
+                if vacuum_state.is_plain_vacuum
+                    && (original_db_path.as_deref() == Some(":memory:")
+                        || program.connection.db.mvcc_enabled())
+                {
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 }
@@ -14454,138 +14459,73 @@ fn op_vacuum_inner(
             OpVacuumSubState::Done { dest_conn } => {
                 dest_conn.execute("COMMIT")?;
 
-                let finalize_result = (|| -> Result<()> {
-                    // Handle plain VACUUM: overwrite the original database with the vacuumed copy
-                    if vacuum_state.is_plain_vacuum {
-                        let original_path =
-                            vacuum_state.original_db_path.as_ref().ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "Missing original database path for plain VACUUM".to_string(),
-                                )
-                            })?;
-                        let temp_path =
-                            vacuum_state.temp_vacuum_path.as_ref().ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "Missing temporary database path for plain VACUUM".to_string(),
-                                )
-                            })?;
+                if vacuum_state.is_plain_vacuum {
+                    let original_path =
+                        vacuum_state.original_db_path.as_ref().ok_or_else(|| {
+                            LimboError::InternalError(
+                                "Missing original database path for plain VACUUM".to_string(),
+                            )
+                        })?;
+                    let temp_path = vacuum_state.temp_vacuum_path.as_ref().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "Missing temporary database path for plain VACUUM".to_string(),
+                        )
+                    })?;
 
-                        if original_path != ":memory:" {
-                            // Flush destination WAL into the main DB file so the
-                            // copied temp file is a complete standalone image
-                            dest_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                    if original_path != ":memory:" {
+                        dest_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                        drop(dest_conn);
 
-                            // Close destination before filesystem operations on temp DB
-                            drop(dest_conn);
+                        program.connection.execute("COMMIT")?;
+                        program
+                            .connection
+                            .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
-                            if program.connection.db.mvcc_enabled() {
-                                // commit and checkpoint before replacing the file to flush
-                                // all WAL frames and prevent stale frame replay
-                                program.connection.execute("COMMIT")?;
-                                program
-                                    .connection
-                                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                        // Hold an exclusive lock while overwriting so concurrent
+                        // writers cannot sneak WAL frames between checkpoint and
+                        // the copy-back.
+                        program.connection.execute("BEGIN EXCLUSIVE")?;
 
-                                remove_vacuum_sidecars(temp_path)?;
-                                match std::fs::rename(temp_path, original_path) {
-                                    Ok(()) => {}
-                                    Err(err)
-                                        if err.kind() == std::io::ErrorKind::CrossesDevices =>
-                                    {
-                                        copy_vacuum_file_into_source(temp_path, original_path)?;
-                                        match std::fs::remove_file(temp_path) {
-                                            Ok(()) => {}
-                                            Err(remove_err)
-                                                if remove_err.kind()
-                                                    == std::io::ErrorKind::NotFound => {}
-                                            Err(remove_err) => {
-                                                return Err(LimboError::InternalError(format!(
-                                                    "Failed to remove VACUUM temp database {temp_path}: {remove_err}"
-                                                )));
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        return Err(LimboError::InternalError(format!(
-                                            "Failed to overwrite database during VACUUM: {err}"
-                                        )));
-                                    }
-                                }
-                            } else {
-                                // commit the exclusive transaction and checkpoint to flush all WAL
-                                // frames into the main DB
-                                program.connection.execute("COMMIT")?;
-                                program
-                                    .connection
-                                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                        // Overwrite source with compacted content. We use copy
+                        // (truncate-then-write on the same path) rather than
+                        // rename so the pager's open fd keeps the same inode.
+                        if let Err(err) = copy_vacuum_file_into_source(temp_path, original_path) {
+                            let _ = program.connection.execute("ROLLBACK");
+                            return Err(err);
+                        }
 
-                                // reaquire exclusive lock to block writers
-                                program.connection.execute("BEGIN EXCLUSIVE")?;
+                        program.connection.execute("COMMIT")?;
 
-                                // Legacy WAL mode overwrites source contents in-place so the
-                                // connection keeps using the same file handle
-                                copy_vacuum_file_into_source(temp_path, original_path)?;
-
-                                // commit empty transaction to release lock
-                                program.connection.execute("COMMIT")?;
-
-                                match std::fs::remove_file(temp_path) {
-                                    Ok(()) => {}
-                                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(err) => {
-                                        return Err(LimboError::InternalError(format!(
-                                            "Failed to remove VACUUM temp database {temp_path}: {err}"
-                                        )));
-                                    }
-                                }
-                                remove_vacuum_sidecars(temp_path)?;
+                        match std::fs::remove_file(temp_path) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(err) => {
+                                return Err(LimboError::InternalError(format!(
+                                    "Failed to remove VACUUM temp database {temp_path}: {err}"
+                                )));
                             }
+                        }
+                        remove_vacuum_sidecars(temp_path)?;
 
-                            // The source DB file content changed under the existing pager
-                            // Drop any cached pages/schema cookie so subsequent statements
-                            // reload from the compacted file image
-                            let source_pager = program.connection.pager.load();
-                            source_pager.clear_page_cache(true);
-                            source_pager.set_schema_cookie(None);
-                        } else {
-                            // Plain VACUUM on :memory: is treated as a no-op in Init.
-                            drop(dest_conn);
-                            let _ = std::fs::remove_file(temp_path);
+                        let source_pager = program.connection.pager.load();
+                        source_pager.clear_page_cache(true);
+                        source_pager.set_schema_cookie(None);
+
+                        for ext in ["-journal", "-log"] {
+                            let sidecar = format!("{original_path}{ext}");
+                            match std::fs::remove_file(&sidecar) {
+                                Ok(()) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(_) => {}
+                            }
                         }
                     } else {
-                        // For VACUUM INTO, just keep the destination file as-is
                         drop(dest_conn);
+                        let _ = std::fs::remove_file(temp_path);
                     }
-                    Ok(())
-                })();
-
-                if let Err(err) = finalize_result {
-                    let _ = program.connection.execute("ROLLBACK");
-                    return Err(err);
-                }
-
-                // Commit source transaction after finalization so plain VACUUM
-                // keeps its write lock through swap/copy-back.
-                if !vacuum_state.is_plain_vacuum {
+                } else {
+                    drop(dest_conn);
                     program.connection.execute("COMMIT")?;
-                }
-
-                // Clean up only non-WAL sidecars at original path.
-                // The -wal and -shm files are owned by the pager and must
-                // NOT be removed while the connection is still active.
-                if vacuum_state.is_plain_vacuum {
-                    if let Some(ref original_path) = vacuum_state.original_db_path {
-                        if original_path != ":memory:" {
-                            for ext in ["-journal", "-log"] {
-                                let sidecar = format!("{original_path}{ext}");
-                                match std::fs::remove_file(&sidecar) {
-                                    Ok(()) => {}
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(_) => {} // best-effort
-                                }
-                            }
-                        }
-                    }
                 }
 
                 state.pc += 1;

@@ -1968,7 +1968,7 @@ fn test_plain_vacuum_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Plain VACUUM should fail with BUSY while another connection holds a write lock.
-#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_plain_vacuum_busy_with_concurrent_writer(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();

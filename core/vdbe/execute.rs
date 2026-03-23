@@ -13670,12 +13670,13 @@ fn op_vacuum_inner(
     }
 
     fn copy_vacuum_file_into_source(temp_path: &str, original_path: &str) -> Result<()> {
-        let mut temp_file = std::fs::File::open(temp_path).map_err(|err| {
+        let data = std::fs::read(temp_path).map_err(|err| {
             LimboError::InternalError(format!(
-                "Failed to open VACUUM temp file {temp_path}: {err}"
+                "Failed to read VACUUM temp file {temp_path}: {err}"
             ))
         })?;
         let mut source_file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .truncate(true)
             .open(original_path)
@@ -13684,9 +13685,10 @@ fn op_vacuum_inner(
                     "Failed to open source database {original_path} for VACUUM copy-back: {err}"
                 ))
             })?;
-        std::io::copy(&mut temp_file, &mut source_file).map_err(|err| {
+        use std::io::Write;
+        source_file.write_all(&data).map_err(|err| {
             LimboError::InternalError(format!(
-                "Failed to copy VACUUM temp file into source database: {err}"
+                "Failed to write VACUUM data into source database: {err}"
             ))
         })?;
         source_file.sync_all().map_err(|err| {
@@ -14476,25 +14478,16 @@ fn op_vacuum_inner(
                         dest_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
                         drop(dest_conn);
 
+                        // Flush all source WAL frames to the main DB file and
+                        // truncate the WAL. After this the source DB file is a
+                        // self-contained image with no WAL frames to replay.
                         program.connection.execute("COMMIT")?;
                         program
                             .connection
                             .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
-                        // Hold an exclusive lock while overwriting so concurrent
-                        // writers cannot sneak WAL frames between checkpoint and
-                        // the copy-back.
-                        program.connection.execute("BEGIN EXCLUSIVE")?;
-
-                        // Overwrite source with compacted content. We use copy
-                        // (truncate-then-write on the same path) rather than
-                        // rename so the pager's open fd keeps the same inode.
-                        if let Err(err) = copy_vacuum_file_into_source(temp_path, original_path) {
-                            let _ = program.connection.execute("ROLLBACK");
-                            return Err(err);
-                        }
-
-                        program.connection.execute("COMMIT")?;
+                        // Overwrite source with compacted content
+                        copy_vacuum_file_into_source(temp_path, original_path)?;
 
                         match std::fs::remove_file(temp_path) {
                             Ok(()) => {}
@@ -14507,6 +14500,8 @@ fn op_vacuum_inner(
                         }
                         remove_vacuum_sidecars(temp_path)?;
 
+                        // Force the pager to re-read everything from the
+                        // replaced file on the next access.
                         let source_pager = program.connection.pager.load();
                         source_pager.clear_page_cache(true);
                         source_pager.set_schema_cookie(None);
